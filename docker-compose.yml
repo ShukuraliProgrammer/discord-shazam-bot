@@ -1,0 +1,6 @@
+services:
+  bot:
+    build: .
+    command: python main.py
+    volumes:
+      - .:/app
