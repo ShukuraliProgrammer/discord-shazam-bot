@@ -1,6 +1,8 @@
 
 import aiohttp
 import random
+from providers.spotify import get_spotify_token
+from collections import Counter
 
 async def get_artist_recommendations(artist_name, token):
     """Get recommendations based on similar artists"""
@@ -271,3 +273,66 @@ def get_fallback_recommendations(top_artists, mood):
         })
 
     return recommendations
+
+
+
+
+
+
+async def generate_smart_recommendations(history, mood=None):
+    """Generate smart recommendations based on user history"""
+    recommendations = []
+
+    if not history:
+        return recommendations
+
+    # Analyze user's music patterns
+    artists = [item[1] for item in history]
+    genres = [item[2] for item in history if item[2]]
+
+    # Get most frequent artists and genres
+    artist_counts = Counter(artists)
+    genre_counts = Counter(genres) if genres else Counter()
+
+    # Get top artists (limit to avoid API overuse)
+    top_artists = [artist for artist, count in artist_counts.most_common(5)]
+    top_genres = [genre for genre, count in genre_counts.most_common(3)] if genres else []
+
+    try:
+        # Get Spotify token
+        token = await get_spotify_token()
+        if not token:
+            return get_fallback_recommendations(top_artists, mood)
+
+        # Strategy 1: Get recommendations based on top artists
+        for artist in top_artists[:3]:  # Limit to top 3 artists
+            artist_recs = await get_artist_recommendations(artist, token)
+            recommendations.extend(artist_recs)
+
+        # Strategy 2: Get genre-based recommendations if we have genres
+        if top_genres:
+            genre_recs = await get_genre_recommendations(top_genres, token, mood)
+            recommendations.extend(genre_recs)
+
+        # Strategy 3: Get mood-based recommendations
+        if mood:
+            mood_recs = await get_mood_recommendations(mood, token, top_artists)
+            recommendations.extend(mood_recs)
+
+        # Remove duplicates and limit results
+        seen_tracks = set()
+        unique_recommendations = []
+
+        for rec in recommendations:
+            track_key = f"{rec['title']}_{rec['artist']}"
+            if track_key not in seen_tracks:
+                seen_tracks.add(track_key)
+                unique_recommendations.append(rec)
+
+        # Sort by match score and return top 10
+        unique_recommendations.sort(key=lambda x: x['match_score'], reverse=True)
+        return unique_recommendations[:10]
+
+    except Exception as e:
+        print(f"Error generating recommendations: {e}")
+        return get_fallback_recommendations(top_artists, mood)

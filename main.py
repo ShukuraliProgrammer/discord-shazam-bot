@@ -4,146 +4,37 @@ ssl_context.check_hostname = False
 ssl_context.verify_mode = ssl.CERT_NONE
 
 import discord
-from discord.ext import commands
-import aiohttp
 import os
 import json
 import sqlite3
 from datetime import datetime
-import requests
-import base64
-import hashlib
-import hmac
 import time
 from dotenv import load_dotenv
-from collections import Counter
+from recomendations import generate_smart_recommendations
 
-from recomendations import (get_mood_recommendations, get_genre_recommendations,
-                            get_artist_recommendations, get_fallback_recommendations)
+from settings import MusicRecognitionBot
+from audio_recognition import recognize_audio
+from utils import get_provider_color, get_provider_emoji, format_duration, get_mood_from_features
+from providers.spotify import search_spotify, get_song_analysis
+from providers.yandex import search_yandex_music
+from providers.youtube import search_youtube_music
+from providers.apple import search_apple_music
+
+from db import save_to_history
+
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-
-# Database setup
-def init_db():
-    conn = sqlite3.connect('music_bot.db')
-    c = conn.cursor()
-
-    # User music history
-    c.execute('''CREATE TABLE IF NOT EXISTS user_history
-                 (user_id TEXT, song_title TEXT, artist TEXT, timestamp TEXT, 
-                  spotify_url TEXT, youtube_url TEXT, genre TEXT, mood TEXT)''')
-
-    # User music preferences and recommendations
-    c.execute('''CREATE TABLE IF NOT EXISTS user_preferences
-                 (user_id TEXT, favorite_genres TEXT, favorite_artists TEXT, 
-                  mood_preferences TEXT, discovery_score INTEGER)''')
-
-    # Community music sharing
-    c.execute('''CREATE TABLE IF NOT EXISTS shared_music
-                 (share_id TEXT, user_id TEXT, song_title TEXT, artist TEXT,
-                  timestamp TEXT, likes INTEGER, server_id TEXT, channel_id TEXT)''')
-
-    # Collaborative playlists
-    c.execute('''CREATE TABLE IF NOT EXISTS playlists
-                 (playlist_id TEXT, name TEXT, creator_id TEXT, server_id TEXT,
-                  contributors TEXT, songs TEXT, created_at TEXT)''')
-
-    conn.commit()
-    conn.close()
-
-
-class MusicRecognitionBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.all()
-        super().__init__(command_prefix='!', intents=intents)
-        self.acrcloud_host = 'identify-ap-southeast-1.acrcloud.com'
-        self.acrcloud_access_key = os.getenv('ACRCLOUD_ACCESS_KEY')
-        self.acrcloud_access_secret = os.getenv('ACRCLOUD_ACCESS_SECRET')
-        self.spotify_client_id = os.getenv('SPOTIFY_CLIENT_ID')
-        self.spotify_client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
-        self.youtube_api_key = os.getenv('YOUTUBE_API_KEY')
-        self.lastfm_api_key = os.getenv('LASTFM_API_KEY')
-
-        init_db()
-
-    async def on_ready(self):
-        print(f'{self.user} is ready to recognize music!')
-        await self.change_presence(
-            activity=discord.Activity(type=discord.ActivityType.listening, name="for music to identify"))
 
 
 bot = MusicRecognitionBot()
 
 
-# ACRCloud integration for music recognition
-def recognize_audio(audio_data):
-    """Recognize audio using ACRCloud API"""
-    timestamp = str(int(time.time()))
-    string_to_sign = f"POST\n/v1/identify\n{bot.acrcloud_access_key}\naudio\n1\n{timestamp}"
-    signature = base64.b64encode(
-        hmac.new(
-            bot.acrcloud_access_secret.encode('utf-8'),
-            string_to_sign.encode('utf-8'),
-            hashlib.sha1
-        ).digest()
-    ).decode('utf-8')
-
-    files = {'sample': audio_data}
-    data = {
-        'access_key': bot.acrcloud_access_key,
-        'sample_bytes': len(audio_data),
-        'timestamp': timestamp,
-        'signature': signature,
-        'data_type': 'audio',
-        'signature_version': '1'
-    }
-
-    response = requests.post(f'http://{bot.acrcloud_host}/v1/identify', files=files, data=data)
-    return response.json()
-
-
-# Spotify integration
-async def get_spotify_token():
-    """Get Spotify access token"""
-    auth_string = f"{bot.spotify_client_id}:{bot.spotify_client_secret}"
-    auth_bytes = auth_string.encode("utf-8")
-    auth_base64 = str(base64.b64encode(auth_bytes), "utf-8")
-
-    url = "https://accounts.spotify.com/api/token"
-    headers = {
-        "Authorization": f"Basic {auth_base64}",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    data = {"grant_type": "client_credentials"}
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, data=data) as response:
-            json_result = await response.json()
-            return json_result["access_token"]
-
-
-async def get_song_analysis(track_id):
-    """Get detailed Spotify audio analysis"""
-    token = await get_spotify_token()
-    headers = {"Authorization": f"Bearer {token}"}
-
-    async with aiohttp.ClientSession() as session:
-        # Get audio features
-        async with session.get(f"https://api.spotify.com/v1/audio-features/{track_id}", headers=headers) as response:
-            features = await response.json()
-
-        # Get audio analysis
-        async with session.get(f"https://api.spotify.com/v1/audio-analysis/{track_id}", headers=headers) as response:
-            analysis = await response.json()
-
-    return features, analysis
-
 @bot.event
 async def on_ready():
     await bot.tree.sync()
 
-# Music recognition command
+
 @bot.command(name='identify')
 async def identify_music(ctx):
     """Identify music from audio file or voice channel"""
@@ -170,34 +61,71 @@ async def identify_music(ctx):
                 album = music.get('album', {}).get('name', 'Unknown Album')
                 release_date = music.get('release_date', 'Unknown')
                 print("Title: ", title, artist)
-                # Get additional info from Spotify
-                spotify_info = await search_spotify(f"{title} {artist}")
+
+                # Search across multiple providers
+                music_info, provider_used = await search_multiple_providers(f"{title} {artist}")
 
                 # Create rich embed
                 embed = discord.Embed(
                     title="🎵 Song Identified!",
                     description=f"**{title}** by **{artist}**",
-                    color=0x1DB954
+                    color=get_provider_color(provider_used)
                 )
                 embed.add_field(name="Album", value=album, inline=True)
                 embed.add_field(name="Release Date", value=release_date, inline=True)
+                embed.add_field(name="Found on", value=get_provider_emoji(provider_used) + provider_used, inline=True)
 
-                if spotify_info:
-                    embed.add_field(name="Popularity", value=f"{spotify_info.get('popularity', 0)}/100", inline=True)
-                    embed.add_field(name="Preview",
-                                    value="[Listen on Spotify](https://open.spotify.com/track/" + spotify_info[
-                                        'id'] + ")", inline=False)
+                if music_info:
+                    # Add provider-specific information
+                    if provider_used == "Spotify":
+                        embed.add_field(name="Popularity", value=f"{music_info.get('popularity', 0)}/100", inline=True)
+                        embed.add_field(name="Listen",
+                                        value=f"[🎧 Spotify](https://open.spotify.com/track/{music_info['id']})",
+                                        inline=False)
 
-                    # Add audio features
-                    features, analysis = await get_song_analysis(spotify_info['id'])
-                    if features:
-                        mood = get_mood_from_features(features)
-                        embed.add_field(name="Mood", value=mood, inline=True)
-                        #embed.add_field(name="Danceability", value=f"{features['danceability']:.1%}", inline=True)
-                        #embed.add_field(name="Energy", value=f"{features['energy']:.1%}", inline=True)
+                        # Add audio features for Spotify
+                        features, analysis = await get_song_analysis(music_info['id'])
+                        if features:
+                            mood = get_mood_from_features(features)
+                            embed.add_field(name="Mood", value=mood, inline=True)
 
-                # Save to user history
-                save_to_history(ctx.author.id, title, artist, spotify_info.get('external_urls', {}).get('spotify', ''))
+                    elif provider_used == "YouTube Music":
+                        embed.add_field(name="Duration", value=format_duration(music_info.get('duration', 0)),
+                                        inline=True)
+                        if 'videoId' in music_info['id']:
+                            embed.add_field(name="Listen",
+                                            value=f"[📺 YouTube](https://youtube.com/watch?v={music_info['id']['videoId']})",
+                                            inline=False)
+
+                    elif provider_used == "Yandex Music":
+                        embed.add_field(name="Duration", value=format_duration(music_info.get('durationMs', 0)),
+                                        inline=True)
+                        if 'id' in music_info:
+                            embed.add_field(name="Listen",
+                                            value=f"[🎵 Yandex Music](https://music.yandex.ru/album/{music_info.get('albums', [{}])[0].get('id', '')}/track/{music_info['id']})",
+                                            inline=False)
+
+                    elif provider_used == "Apple Music":
+                        embed.add_field(name="Genre", value=music_info.get('primaryGenreName', 'Unknown'), inline=True)
+                        if 'trackViewUrl' in music_info:
+                            embed.add_field(name="Listen",
+                                            value=f"[🍎 Apple Music]({music_info['trackViewUrl']})",
+                                            inline=False)
+
+                    elif provider_used == "SoundCloud":
+                        embed.add_field(name="Plays", value=f"{music_info.get('playback_count', 0):,}", inline=True)
+                        if 'permalink_url' in music_info:
+                            embed.add_field(name="Listen",
+                                            value=f"[☁️ SoundCloud]({music_info['permalink_url']})",
+                                            inline=False)
+
+                else:
+                    embed.add_field(name="Status", value="❌ Not found on any music platform", inline=False)
+
+                # Save to user history with provider info
+                save_to_history(ctx.author.id, title, artist,
+                                music_info.get(' c', {}).get('spotify',
+                                                                        '') if provider_used == "Spotify" else "")
 
                 # Add reaction buttons
                 await processing_msg.edit(content="", embed=embed)
@@ -213,6 +141,31 @@ async def identify_music(ctx):
 
     else:
         await ctx.send("🎤 Please upload an audio file or use `!listen` to identify from voice channel")
+
+
+async def search_multiple_providers(query):
+    """Search across multiple music providers in order of preference"""
+    providers = [
+        ("Yandex Music", search_yandex_music),
+        ("Spotify", search_spotify),
+        ("Apple Music", search_apple_music),
+        ("YouTube Music", search_youtube_music)
+    ]
+
+    for provider_name, search_func in providers:
+        try:
+            result = await search_func(query)
+            if result:
+                print(f"✅ Found on {provider_name}: {query}")
+                return result, provider_name
+        except Exception as e:
+            print(f"❌ Failed to search {provider_name}: {e}")
+            continue
+
+    print(f"❌ Song not found on any provider: {query}")
+    return None, "Not Found"
+
+
 
 
 # Advanced recommendation system
@@ -253,7 +206,7 @@ async def get_recommendations(ctx, *, mood_or_genre=None):
 
 
 # Collaborative playlist feature
-@bot.command(name='playlist')
+@bot.command(name='playlistt')
 async def playlist_commands(ctx, action=None, *, args=None):
     """Manage collaborative playlists"""
     if action == "create":
@@ -342,7 +295,7 @@ async def share_music(ctx, *, song_info=None):
 
 
 # Music analytics and insights
-@bot.command(name='stats')
+@bot.command(name='statss')
 async def music_stats(ctx, user: discord.Member = None):
     """Show music listening statistics"""
     target_user = user or ctx.author
@@ -421,141 +374,7 @@ async def mood_music(ctx, *, mood=None):
     embed.add_field(name="Coming Soon!", value="Mood-based recommendations will be available soon!", inline=False)
 
     await ctx.send(embed=embed)
-#
-# from discord.ext import audiorec
-#
-# @bot.command(name='listen')
-# async def listen_to_voice(ctx):
-#     """Listen to voice channel and identify playing music"""
-#     if not ctx.author.voice:
-#         await ctx.send("❌ You need to be in a voice channel!")
-#         return
-#
-#     channel = ctx.author.voice.channel
-#     vc = await channel.connect()
-#
-#     # Record audio from voice channel
-#     audio_sink = AudioSink()
-#     vc.start_recording(audio_sink, finished_callback)
-#
-#     await ctx.send("🎧 Listening to voice channel... Say 'stop' to end recording")
-#
-#     # Wait for stop command or timeout
-#     await asyncio.sleep(10)  # 10 second sample
-#     vc.stop_recording()
-#     await vc.disconnect()
-#
-#     # Process recorded audio
-#     if audio_sink.audio_data:
-#         result = recognize_audio(audio_sink.audio_data)
-#         print("Result: ", result)
 
-
-
-# Helper functions
-def get_mood_from_features(features):
-    """Determine mood from Spotify audio features"""
-    valence = features.get('valence', 0.5)
-    #energy = features.get('energy', 0.5)
-    #danceability = features.get('danceability', 0.5)
-
-    if valence > 0.7:
-        return "😄 Happy & Energetic"
-    #elif valence > 0.6 and danceability > 0.7:
-    #    return "🕺 Upbeat & Danceable"
-    #elif valence < 0.4 and energy < 0.4:
-    #    return "😢 Sad & Mellow"
-    #elif energy > 0.8:
-    #    return "⚡ High Energy"
-    elif valence > 0.6:
-        return "😊 Positive"
-    else:
-        return "😐 Neutral"
-
-
-def save_to_history(user_id, title, artist, spotify_url):
-    """Save identified song to user history"""
-    conn = sqlite3.connect('music_bot.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO user_history VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-              (str(user_id), title, artist, datetime.now().isoformat(),
-               spotify_url, "", "", ""))
-    conn.commit()
-    conn.close()
-
-
-async def search_spotify(query):
-    """Search for a song on Spotify"""
-    token = await get_spotify_token()
-    headers = {"Authorization": f"Bearer {token}"}
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f"https://api.spotify.com/v1/search?q={query}&type=track&limit=1",
-                               headers=headers) as response:
-            data = await response.json()
-            if data['tracks']['items']:
-                return data['tracks']['items'][0]
-    return None
-
-
-
-async def generate_smart_recommendations(history, mood=None):
-    """Generate smart recommendations based on user history"""
-    recommendations = []
-
-    if not history:
-        return recommendations
-
-    # Analyze user's music patterns
-    artists = [item[1] for item in history]
-    genres = [item[2] for item in history if item[2]]
-
-    # Get most frequent artists and genres
-    artist_counts = Counter(artists)
-    genre_counts = Counter(genres) if genres else Counter()
-
-    # Get top artists (limit to avoid API overuse)
-    top_artists = [artist for artist, count in artist_counts.most_common(5)]
-    top_genres = [genre for genre, count in genre_counts.most_common(3)] if genres else []
-
-    try:
-        # Get Spotify token
-        token = await get_spotify_token()
-        if not token:
-            return get_fallback_recommendations(top_artists, mood)
-
-        # Strategy 1: Get recommendations based on top artists
-        for artist in top_artists[:3]:  # Limit to top 3 artists
-            artist_recs = await get_artist_recommendations(artist, token)
-            recommendations.extend(artist_recs)
-
-        # Strategy 2: Get genre-based recommendations if we have genres
-        if top_genres:
-            genre_recs = await get_genre_recommendations(top_genres, token, mood)
-            recommendations.extend(genre_recs)
-
-        # Strategy 3: Get mood-based recommendations
-        if mood:
-            mood_recs = await get_mood_recommendations(mood, token, top_artists)
-            recommendations.extend(mood_recs)
-
-        # Remove duplicates and limit results
-        seen_tracks = set()
-        unique_recommendations = []
-
-        for rec in recommendations:
-            track_key = f"{rec['title']}_{rec['artist']}"
-            if track_key not in seen_tracks:
-                seen_tracks.add(track_key)
-                unique_recommendations.append(rec)
-
-        # Sort by match score and return top 10
-        unique_recommendations.sort(key=lambda x: x['match_score'], reverse=True)
-        return unique_recommendations[:10]
-
-    except Exception as e:
-        print(f"Error generating recommendations: {e}")
-        return get_fallback_recommendations(top_artists, mood)
 
 # Event handlers for reactions
 @bot.event
@@ -574,7 +393,6 @@ async def on_reaction_add(reaction, user):
                       (datetime.now().date().isoformat(),))
             conn.commit()
             conn.close()
-
 
 
 # Run the bot
