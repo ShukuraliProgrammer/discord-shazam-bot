@@ -19,6 +19,8 @@ from providers.spotify import search_spotify, get_song_analysis
 from providers.yandex import search_yandex_music
 from providers.youtube import search_youtube_music
 from providers.apple import search_apple_music
+from parser import parse_search_query
+from searches import search_all_platforms
 
 from db import save_to_history
 
@@ -206,7 +208,7 @@ async def get_recommendations(ctx, *, mood_or_genre=None):
 
 
 # Collaborative playlist feature
-@bot.command(name='playlistt')
+@bot.command(name='playlist')
 async def playlist_commands(ctx, action=None, *, args=None):
     """Manage collaborative playlists"""
     if action == "create":
@@ -295,7 +297,7 @@ async def share_music(ctx, *, song_info=None):
 
 
 # Music analytics and insights
-@bot.command(name='statss')
+@bot.command(name='stats')
 async def music_stats(ctx, user: discord.Member = None):
     """Show music listening statistics"""
     target_user = user or ctx.author
@@ -376,6 +378,134 @@ async def mood_music(ctx, *, mood=None):
     await ctx.send(embed=embed)
 
 
+@bot.command(name='search')
+async def search_music(ctx, *, query):
+    """
+    Search for music across multiple platforms
+    Usage:
+    !search song:"Song Name" artist:"Artist Name" year:2023
+    !search song:"Bohemian Rhapsody" artist:"Queen" platform:spotify
+    !search song:"Shape of You" platform:"youtube"
+
+    Supported platforms: spotify, youtube, yandex
+    """
+
+    # Parse the search query
+    search_params = parse_search_query(query)
+
+    if not search_params.get('song'):
+        await ctx.send(
+            "❌ Please provide at least a song name. Example: `!search song:\"Bohemian Rhapsody\" artist:\"Queen\"`")
+        return
+
+    # Create loading message
+    loading_embed = discord.Embed(
+        title="🔍 Searching...",
+        description="Finding matches across platforms...",
+        color=0x3498db
+    )
+    message = await ctx.send(embed=loading_embed)
+
+    try:
+        # Search across multiple platforms
+        search_results = await search_all_platforms(search_params)
+
+        if not search_results:
+            error_embed = discord.Embed(
+                title="❌ No Results Found",
+                description="Couldn't find any matches for your search.",
+                color=0xe74c3c
+            )
+            await message.edit(embed=error_embed)
+            return
+
+        # Create results embed
+        results_embed = discord.Embed(
+            title="🎵 Search Results",
+            description=f"Found {len(search_results)} matches",
+            color=0x1DB954
+        )
+
+        # Add search query info
+        query_info = []
+        if search_params.get('song'):
+            query_info.append(f"**Song:** {search_params['song']}")
+        if search_params.get('artist'):
+            query_info.append(f"**Artist:** {search_params['artist']}")
+        if search_params.get('year'):
+            query_info.append(f"**Year:** {search_params['year']}")
+        if search_params.get('platform'):
+            platform_emoji = {
+                'spotify': '🎵',
+                'youtube': '📺',
+                'yandex': '🎶'
+            }
+            emoji = platform_emoji.get(search_params['platform'], '🎧')
+            query_info.append(f"**Platform:** {emoji} {search_params['platform'].title()}")
+
+        results_embed.add_field(
+            name="Search Query",
+            value="\n".join(query_info),
+            inline=False
+        )
+
+        # Add results
+        for i, result in enumerate(search_results[:5], 1):  # Limit to 5 results
+            links = []
+            if result.get('spotify_url'):
+                links.append(f"[Spotify]({result['spotify_url']})")
+            if result.get('youtube_url'):
+                links.append(f"[YouTube]({result['youtube_url']})")
+            if result.get('yandex_url'):
+                links.append(f"[Yandex Music]({result['yandex_url']})")
+
+            # Show platform source with emoji
+            platform_info = ""
+            if result.get('source_platform'):
+                platform_emojis = {
+                    'spotify': '🎵',
+                    'youtube': '📺',
+                    'yandex': '🎶'
+                }
+                emoji = platform_emojis.get(result['source_platform'], '🎧')
+                platform_info = f"{emoji} "
+
+            result_info = []
+            if result.get('album'):
+                result_info.append(f"Album: {result['album']}")
+            if result.get('year'):
+                result_info.append(f"Year: {result['year']}")
+            if result.get('duration'):
+                result_info.append(f"Duration: {result['duration']}")
+
+            field_value = ""
+            if result_info:
+                field_value += " • ".join(result_info) + "\n"
+            if links:
+                field_value += " | ".join(links)
+            else:
+                field_value += "No direct links available"
+
+            results_embed.add_field(
+                name=f"{platform_info}{i}. {result['title']} - {result['artist']}",
+                value=field_value,
+                inline=False
+            )
+
+        # Add footer
+        results_embed.set_footer(text="🎧 Click the links to listen on your preferred platform")
+
+        await message.edit(embed=results_embed)
+
+    except Exception as e:
+        error_embed = discord.Embed(
+            title="❌ Search Error",
+            description="An error occurred while searching. Please try again.",
+            color=0xe74c3c
+        )
+        await message.edit(embed=error_embed)
+        print(f"Search error: {e}")
+
 # Event handlers for reactions
 @bot.event
 async def on_reaction_add(reaction, user):
@@ -394,6 +524,121 @@ async def on_reaction_add(reaction, user):
             conn.commit()
             conn.close()
 
+
+@bot.command(name='helpp')
+async def help_command(ctx, command=None):
+    """Display all available commands or detailed help for a specific command"""
+
+    if command:
+        # Detailed help for specific commands
+        command_help = {
+            'identify': {
+                'title': '🎵 Identify Music',
+                'description': 'Identify music from an audio file',
+                'usage': '/identify [attach audio file]',
+                'example': 'Upload an audio file and use /identify to get song details'
+            },
+            'recommend': {
+                'title': '🎯 Personal Recommendations',
+                'description': 'Get personalized music recommendations based on your listening history',
+                'usage': '/recommend',
+                'example': '/recommend'
+            },
+            'playlist': {
+                'title': '📝 Playlist Management',
+                'description': 'Manage your playlists',
+                'usage': '/playlist [list|create] [playlist_name]',
+                'example': '/playlist list\n/playlist create "My Favorites"'
+            },
+            'share': {
+                'title': '📤 Share Music',
+                'description': 'Share music with other users',
+                'usage': '/share [song/playlist]',
+                'example': '/share "Song Name - Artist"'
+            },
+            'stats': {
+                'title': '📊 Analytics',
+                'description': 'View your music listening analytics and history',
+                'usage': '/stats',
+                'example': '/stats'
+            },
+            'mood': {
+                'title': '🎭 Mood Music',
+                'description': 'Get music recommendations based on your current mood',
+                'usage': '/mood [mood_type]',
+                'example': '/mood happy\n/mood chill'
+            },
+            'search': {
+                'title': '🔍 Search Music',
+                'description': 'Search for music by song name, artist, and platform',
+                'usage': '/search [song_name] [artist] [platform]',
+                'example': '/search "Bohemian Rhapsody" "Queen" spotify'
+            }
+        }
+
+        if command.lower() in command_help:
+            cmd_info = command_help[command.lower()]
+            embed = discord.Embed(
+                title=cmd_info['title'],
+                description=cmd_info['description'],
+                color=0x1DB954  # Spotify green
+            )
+            embed.add_field(name="Usage", value=f"`{cmd_info['usage']}`", inline=False)
+            embed.add_field(name="Example", value=f"`{cmd_info['example']}`", inline=False)
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send("❌ Command not found. Use `/help` to see all available commands.")
+        return
+
+    # General help - show all commands
+    embed = discord.Embed(
+        title="🎵 Music Bot - Available Commands",
+        description="Here are all the commands you can use:",
+        color=0x1DB954
+    )
+
+    # Music Discovery
+    embed.add_field(
+        name="🎵 Music Discovery",
+        value="`/identify` - Identify music from audio file\n"
+              "`/search` - Search music by name, artist, platform\n"
+              "`/mood` - Get music based on your mood",
+        inline=False
+    )
+
+    # Personal Features
+    embed.add_field(
+        name="🎯 Personal Features",
+        value="`/recommend` - Get personalized recommendations\n"
+              "`/stats` - View your listening analytics",
+        inline=False
+    )
+
+    # Playlist Management
+    embed.add_field(
+        name="📝 Playlist Management",
+        value="`/playlist list` - Show all your playlists\n"
+              "`/playlist create` - Create a new playlist",
+        inline=False
+    )
+
+    # Social Features
+    embed.add_field(
+        name="📤 Social Features",
+        value="`/share` - Share music with other users",
+        inline=False
+    )
+
+    embed.add_field(
+        name="💡 Need More Help?",
+        value="Use `/help [command]` for detailed information about a specific command\n"
+              "Example: `/help mood` or `/help search`",
+        inline=False
+    )
+
+    embed.set_footer(text="🎶 Enjoy discovering music!")
+
+    await ctx.send(embed=embed)
 
 # Run the bot
 if __name__ == "__main__":
